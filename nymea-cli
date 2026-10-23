@@ -242,13 +242,20 @@ def build_client(args: argparse.Namespace, *, require_token: bool = True) -> Nym
     port = getattr(args, "port", None) or cfg.get("port") or 4444
     tls = not getattr(args, "plain", False)
     insecure = getattr(args, "insecure", True)
-    token = cfg.get("token") if require_token else None
+    cli_token = getattr(args, "token", None)
+    token = cli_token or (cfg.get("token") if require_token else None)
     client = NymeaClient(host=host, port=int(port), tls=tls, insecure=insecure, token=token)
     client.connect()
     if require_token and client.auth_required and not client.token:
+        if not sys.stdin.isatty():
+            sys.stderr.write(
+                "nymea-cli: authentication required and no token available. "
+                "Run `nymea-cli login` or pass --token.\n"
+            )
+            sys.exit(2)
         sys.stderr.write(
-            "nymea-cli: no cached token. Run `nymea-cli login` first "
-            "(or pass credentials below).\n"
+            "nymea-cli: no cached token. Logging in now "
+            "(or pass --token / run `nymea-cli login` ahead of time).\n"
         )
         username = input("Username: ")
         password = getpass("Password: ")
@@ -560,21 +567,36 @@ def cmd_raw(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------
 
 
-def _attach_common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--host", help="nymead host (default: config / 127.0.0.1)")
-    p.add_argument("--port", type=int, help="WebSocket port (default: 4444)")
+def _attach_common(p: argparse.ArgumentParser, *, is_subparser: bool = False) -> None:
+    """Add the connection flags.
+
+    When `is_subparser` is true, default each arg to SUPPRESS so a value
+    passed to the top-level parser isn't clobbered by the subparser's
+    `None` default when the user didn't repeat the flag.
+    """
+    kw = {"default": argparse.SUPPRESS} if is_subparser else {}
+    p.add_argument("--host", help="nymead host (default: config / 127.0.0.1)", **kw)
+    p.add_argument("--port", type=int, help="WebSocket port (default: 4444)", **kw)
     p.add_argument(
         "--plain",
         action="store_true",
         help="use ws:// instead of wss:// (no TLS)",
+        **kw,
     )
     p.add_argument(
         "--secure",
         dest="insecure",
         action="store_false",
         help="verify TLS cert (default: skip verification; nymead uses a self-signed cert)",
+        **kw,
     )
-    p.set_defaults(insecure=True)
+    p.add_argument(
+        "--token",
+        help="use this token for this call only (bypasses the cached config token)",
+        **kw,
+    )
+    if not is_subparser:
+        p.set_defaults(insecure=True)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -582,10 +604,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         prog="nymea-cli",
         description="Command-line client for nymead's JSON-RPC API.",
     )
+    # Attach the connection flags to the top-level parser *and* to each
+    # subcommand (via _attach_common) so they work in either position:
+    #   nymea-cli --host X things list
+    #   nymea-cli things list --host X
+    _attach_common(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("login", help="authenticate and cache a token")
-    _attach_common(sp)
+    _attach_common(sp, is_subparser=True)
     sp.add_argument("--user")
     sp.add_argument("--password", help="password (will prompt if omitted)")
     sp.set_defaults(func=cmd_login)
@@ -593,7 +620,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp = sub.add_parser("things", help="query things")
     sp_sub = sp.add_subparsers(dest="sub", required=True)
     spl = sp_sub.add_parser("list", help="list things")
-    _attach_common(spl)
+    _attach_common(spl, is_subparser=True)
     spl.add_argument("filter", nargs="?", help="case-insensitive substring filter on name")
     spl.add_argument("--json", action="store_true")
     spl.set_defaults(func=cmd_things_list)
@@ -601,7 +628,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp = sub.add_parser("state", help="query thing state")
     sp_sub = sp.add_subparsers(dest="sub", required=True)
     spg = sp_sub.add_parser("get", help="get current state value(s)")
-    _attach_common(spg)
+    _attach_common(spg, is_subparser=True)
     spg.add_argument("thing", help="thing name or id")
     spg.add_argument("state", nargs="?", help="state name or id (omit for all)")
     spg.add_argument("--json", action="store_true")
@@ -610,7 +637,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp = sub.add_parser("action", help="execute an action on a thing")
     sp_sub = sp.add_subparsers(dest="sub", required=True)
     spe = sp_sub.add_parser("exec", help="execute action")
-    _attach_common(spe)
+    _attach_common(spe, is_subparser=True)
     spe.add_argument("thing", help="thing name or id")
     spe.add_argument("action", help="action name or id")
     spe.add_argument(
@@ -624,7 +651,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp = sub.add_parser("events", help="stream nymead notifications")
     sp_sub = sp.add_subparsers(dest="sub", required=True)
     spw = sp_sub.add_parser("watch", help="watch state/event notifications")
-    _attach_common(spw)
+    _attach_common(spw, is_subparser=True)
     spw.add_argument("--filter-thing", help="only emit for this thing")
     spw.add_argument(
         "--namespace",
@@ -637,13 +664,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp = sub.add_parser("log", help="toggle log categories (if nymead supports it)")
     sp_sub = sp.add_subparsers(dest="sub", required=True)
     sps = sp_sub.add_parser("set", help="set a category's level at runtime")
-    _attach_common(sps)
+    _attach_common(sps, is_subparser=True)
     sps.add_argument("category", help="e.g. GenericShading, UniPi, IOConnections")
     sps.add_argument("level", choices=["debug", "info", "warning", "critical"])
     sps.set_defaults(func=cmd_log_set)
 
     sp = sub.add_parser("raw", help="issue an arbitrary JSON-RPC call (escape hatch)")
-    _attach_common(sp)
+    _attach_common(sp, is_subparser=True)
     sp.add_argument("method", help="e.g. Integrations.GetThings")
     sp.add_argument("--params", help="JSON object with params")
     sp.set_defaults(func=cmd_raw)
