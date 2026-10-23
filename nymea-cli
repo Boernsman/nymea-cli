@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""nymea-cli — command-line client for nymead's JSON-RPC API.
+
+Hits nymead's WebSocket JSON-RPC endpoint (default wss://host:4444) and
+exposes the handful of operations that make live debugging ergonomic:
+list things, read states, execute actions, stream notifications, toggle
+log categories at runtime.
+
+Config and cached auth token live at ~/.config/nymea-cli/config.json
+(or $XDG_CONFIG_HOME/nymea-cli/config.json).
+
+Dependencies: websocket-client (`pip install websocket-client`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import threading
+import time
+from getpass import getpass
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+try:
+    from websocket import (  # type: ignore
+        WebSocket,
+        WebSocketConnectionClosedException,
+        WebSocketTimeoutException,
+        create_connection,
+    )
+except ImportError:
+    sys.stderr.write(
+        "nymea-cli: missing dependency 'websocket-client'.\n"
+        "Install with: pip install websocket-client\n"
+    )
+    sys.exit(2)
+
+
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    / "nymea-cli"
+)
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
+
+class NymeaError(Exception):
+    """Raised for protocol-level failures (bad method, error response, etc.)."""
+
+
+class NymeaClient:
+    """Thin synchronous JSON-RPC client over nymead's WebSocket endpoint.
+
+    Call `connect()` first. If `authenticationRequired` comes back true in
+    the hello handshake and no token is cached, call `authenticate()`.
+    `call()` issues a request and blocks until the matching response
+    arrives, buffering any notifications it sees in the meantime for
+    `drain_notifications()` or `recv_loop()` to pick up later.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int = 4444,
+        tls: bool = True,
+        insecure: bool = True,
+        token: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.tls = tls
+        self.insecure = insecure
+        self.token = token
+        self.timeout = timeout
+        self.ws: Optional[WebSocket] = None
+        self._send_lock = threading.Lock()
+        self._next_id = 1
+        self._pending_notifications: List[dict] = []
+        # Populated by connect() from JSONRPC.Hello:
+        self.server_name = ""
+        self.server_version = ""
+        self.protocol_version = ""
+        self.auth_required = True
+        self.initial_setup_required = False
+
+    def connect(self) -> dict:
+        scheme = "wss" if self.tls else "ws"
+        url = f"{scheme}://{self.host}:{self.port}"
+        sslopt: Optional[dict] = None
+        if self.tls and self.insecure:
+            sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
+        self.ws = create_connection(url, timeout=self.timeout, sslopt=sslopt)
+        hello = self.call("JSONRPC.Hello", {"locale": "en_US"})
+        self.server_name = hello.get("name") or hello.get("server") or ""
+        self.server_version = hello.get("version", "")
+        self.protocol_version = hello.get("protocol version") or hello.get("protocolVersion", "")
+        self.auth_required = hello.get("authenticationRequired", True)
+        self.initial_setup_required = hello.get("initialSetupRequired", False)
+        return hello
+
+    def authenticate(self, username: str, password: str, device_name: str = "nymea-cli") -> str:
+        resp = self.call(
+            "Users.Authenticate",
+            {"username": username, "password": password, "deviceName": device_name},
+        )
+        if not resp.get("success", False):
+            raise NymeaError(f"authentication rejected: {resp}")
+        token = resp.get("token")
+        if not token:
+            raise NymeaError(f"authentication succeeded but no token returned: {resp}")
+        self.token = token
+        return token
+
+    def close(self) -> None:
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+    # Low-level ------------------------------------------------------------
+
+    def _send(self, method: str, params: Optional[dict]) -> int:
+        if self.ws is None:
+            raise NymeaError("not connected")
+        with self._send_lock:
+            msg_id = self._next_id
+            self._next_id += 1
+        req: Dict[str, Any] = {"id": msg_id, "method": method}
+        if params:
+            req["params"] = params
+        if self.token:
+            req["token"] = self.token
+        self.ws.send(json.dumps(req))
+        return msg_id
+
+    def _recv(self) -> dict:
+        if self.ws is None:
+            raise NymeaError("not connected")
+        raw = self.ws.recv()
+        if not raw:
+            raise NymeaError("connection closed by server")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise NymeaError(f"malformed JSON from server: {e}: {raw!r}") from e
+
+    def call(self, method: str, params: Optional[dict] = None) -> dict:
+        """Send a request and return the ``params`` block of the response.
+
+        Any notifications received before the matching response are buffered
+        in ``self._pending_notifications`` so a concurrent subscriber doesn't
+        lose them.
+        """
+        msg_id = self._send(method, params)
+        while True:
+            msg = self._recv()
+            if msg.get("id") == msg_id:
+                status = msg.get("status")
+                if status == "success":
+                    return msg.get("params", {})
+                err = (
+                    msg.get("error")
+                    or msg.get("params", {}).get("errorString")
+                    or msg
+                )
+                raise NymeaError(f"{method} failed: {err}")
+            if "notification" in msg:
+                self._pending_notifications.append(msg)
+                continue
+            # Unknown shape — surface and ignore
+            sys.stderr.write(f"nymea-cli: unexpected message: {msg!r}\n")
+
+    def drain_notifications(self) -> List[dict]:
+        out, self._pending_notifications = self._pending_notifications, []
+        return out
+
+    def enable_notifications(self, namespaces: List[str]) -> dict:
+        """Ask nymead to send notifications for the given namespaces."""
+        return self.call("JSONRPC.SetNotificationStatus", {"namespaces": namespaces})
+
+    def recv_loop(self, on_notification: Callable[[dict], None]) -> None:
+        """Block indefinitely dispatching notifications. Ctrl-C to exit."""
+        for pending in self.drain_notifications():
+            on_notification(pending)
+        if self.ws is None:
+            raise NymeaError("not connected")
+        self.ws.settimeout(None)
+        while True:
+            try:
+                msg = self._recv()
+            except WebSocketTimeoutException:
+                continue
+            except WebSocketConnectionClosedException:
+                return
+            if "notification" in msg:
+                on_notification(msg)
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except json.JSONDecodeError:
+        sys.stderr.write(f"warning: {CONFIG_FILE} is not valid JSON; ignoring\n")
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Connection helpers
+# --------------------------------------------------------------------------
+
+
+def build_client(args: argparse.Namespace, *, require_token: bool = True) -> NymeaClient:
+    cfg = load_config()
+    host = getattr(args, "host", None) or cfg.get("host") or "127.0.0.1"
+    port = getattr(args, "port", None) or cfg.get("port") or 4444
+    tls = not getattr(args, "plain", False)
+    insecure = getattr(args, "insecure", True)
+    token = cfg.get("token") if require_token else None
+    client = NymeaClient(host=host, port=int(port), tls=tls, insecure=insecure, token=token)
+    client.connect()
+    if require_token and client.auth_required and not client.token:
+        sys.stderr.write(
+            "nymea-cli: no cached token. Run `nymea-cli login` first "
+            "(or pass credentials below).\n"
+        )
+        username = input("Username: ")
+        password = getpass("Password: ")
+        client.authenticate(username, password)
+        cfg["host"] = host
+        cfg["port"] = int(port)
+        cfg["username"] = username
+        cfg["token"] = client.token
+        save_config(cfg)
+    return client
+
+
+# --------------------------------------------------------------------------
+# Resolution helpers (name → id)
+# --------------------------------------------------------------------------
+
+
+def _all_things(client: NymeaClient) -> List[dict]:
+    return client.call("Integrations.GetThings").get("things", [])
+
+
+def _all_thing_classes(client: NymeaClient) -> List[dict]:
+    return client.call("Integrations.GetThingClasses").get("thingClasses", [])
+
+
+def resolve_thing(client: NymeaClient, needle: str) -> dict:
+    things = _all_things(client)
+    # exact id first
+    for t in things:
+        if t.get("id") == needle:
+            return t
+    # exact name
+    exact = [t for t in things if t.get("name") == needle]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        _die_ambiguous(needle, exact)
+    # case-insensitive substring
+    sub = [t for t in things if needle.lower() in t.get("name", "").lower()]
+    if len(sub) == 1:
+        return sub[0]
+    if len(sub) > 1:
+        _die_ambiguous(needle, sub)
+    sys.stderr.write(f"no thing matched '{needle}'\n")
+    sys.exit(1)
+
+
+def _die_ambiguous(needle: str, matches: List[dict]) -> None:
+    sys.stderr.write(f"ambiguous: {len(matches)} things matched '{needle}':\n")
+    for t in matches:
+        sys.stderr.write(f"  {t.get('id')}  {t.get('name')}\n")
+    sys.exit(1)
+
+
+def resolve_thing_class(client: NymeaClient, class_id: str) -> Optional[dict]:
+    for c in _all_thing_classes(client):
+        if c.get("id") == class_id:
+            return c
+    return None
+
+
+def _find_type(container: dict, key: str, needle: str) -> Optional[dict]:
+    for item in container.get(key, []):
+        if item.get("id") == needle or item.get("name") == needle:
+            return item
+    return None
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    host = args.host or cfg.get("host") or input("Host: ")
+    port = int(args.port or cfg.get("port") or 4444)
+    username = args.user or cfg.get("username") or input("Username: ")
+    password = args.password or getpass("Password: ")
+    client = NymeaClient(
+        host=host, port=port, tls=not args.plain, insecure=args.insecure
+    )
+    client.connect()
+    client.authenticate(username, password)
+    cfg.update({"host": host, "port": port, "username": username, "token": client.token})
+    save_config(cfg)
+    print(f"Logged in to {host}:{port} as {username}. Token cached at {CONFIG_FILE}")
+
+
+def cmd_things_list(args: argparse.Namespace) -> None:
+    client = build_client(args)
+    things = _all_things(client)
+    if args.filter:
+        f = args.filter.lower()
+        things = [t for t in things if f in t.get("name", "").lower()]
+    things.sort(key=lambda t: t.get("name", ""))
+    if args.json:
+        print(json.dumps(things, indent=2))
+        return
+    if not things:
+        print("(no things)")
+        return
+    width = max(len(t.get("name", "")) for t in things)
+    for t in things:
+        print(f"{t.get('name', ''):<{width}}  {t.get('id', '')}")
+
+
+def cmd_state_get(args: argparse.Namespace) -> None:
+    client = build_client(args)
+    thing = resolve_thing(client, args.thing)
+    values = client.call(
+        "Integrations.GetStateValues", {"thingId": thing["id"]}
+    ).get("values", [])
+    cls = resolve_thing_class(client, thing["thingClassId"])
+    name_by_id = {
+        s["id"]: s["name"] for s in (cls.get("stateTypes", []) if cls else [])
+    }
+    if args.state:
+        target = args.state
+        # resolve by name
+        state_type = _find_type(cls or {}, "stateTypes", target)
+        state_id = state_type["id"] if state_type else target
+        match = [v for v in values if v.get("stateTypeId") == state_id]
+        if not match:
+            sys.stderr.write(f"no state '{args.state}' on {thing.get('name')}\n")
+            sys.exit(1)
+        if args.json:
+            print(json.dumps(match[0], indent=2))
+        else:
+            print(match[0].get("value"))
+        return
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "name": name_by_id.get(v.get("stateTypeId"), v.get("stateTypeId")),
+                        **v,
+                    }
+                    for v in values
+                ],
+                indent=2,
+            )
+        )
+        return
+    print(f"# {thing.get('name')}  ({thing.get('id')})")
+    width = max(
+        (len(name_by_id.get(v.get("stateTypeId"), v.get("stateTypeId", ""))) for v in values),
+        default=0,
+    )
+    for v in values:
+        name = name_by_id.get(v.get("stateTypeId"), v.get("stateTypeId"))
+        print(f"  {name:<{width}}  {v.get('value')}")
+
+
+def cmd_action_exec(args: argparse.Namespace) -> None:
+    client = build_client(args)
+    thing = resolve_thing(client, args.thing)
+    cls = resolve_thing_class(client, thing["thingClassId"])
+    if cls is None:
+        raise NymeaError(f"could not resolve thingClassId {thing['thingClassId']}")
+    action = _find_type(cls, "actionTypes", args.action)
+    if action is None:
+        sys.stderr.write(
+            f"no action '{args.action}' on {thing.get('name')} "
+            f"(class {cls.get('name')})\n"
+        )
+        if cls.get("actionTypes"):
+            sys.stderr.write("available actions:\n")
+            for a in cls["actionTypes"]:
+                sys.stderr.write(f"  {a.get('name')}  ({a.get('id')})\n")
+        sys.exit(1)
+    name_to_pid = {
+        p.get("name"): p.get("id") for p in action.get("paramTypes", [])
+    }
+    params = []
+    for kv in args.params or []:
+        if "=" not in kv:
+            raise NymeaError(f"bad param '{kv}', expected name=value")
+        k, v = kv.split("=", 1)
+        pid = name_to_pid.get(k, k)
+        try:
+            parsed: Any = json.loads(v)
+        except json.JSONDecodeError:
+            parsed = v
+        params.append({"paramTypeId": pid, "value": parsed})
+    req: Dict[str, Any] = {
+        "thingId": thing["id"],
+        "actionTypeId": action["id"],
+    }
+    if params:
+        req["params"] = params
+    result = client.call("Integrations.ExecuteAction", req)
+    err = result.get("thingError", "ThingErrorNoError")
+    if err != "ThingErrorNoError":
+        display = result.get("displayMessage", "")
+        sys.stderr.write(f"action failed: {err}  {display}\n")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"ok: {thing.get('name')} -> {action.get('name')}")
+
+
+def cmd_events_watch(args: argparse.Namespace) -> None:
+    client = build_client(args)
+    things = _all_things(client)
+    classes = _all_thing_classes(client)
+    thing_by_id = {t["id"]: t for t in things}
+    class_by_id = {c["id"]: c for c in classes}
+
+    filter_thing_id: Optional[str] = None
+    if args.filter_thing:
+        filter_thing_id = resolve_thing(client, args.filter_thing)["id"]
+
+    namespaces = args.namespace or ["Integrations"]
+    client.enable_notifications(namespaces)
+    sys.stderr.write(
+        f"watching namespaces {namespaces}"
+        + (f" filter_thing={filter_thing_id}" if filter_thing_id else "")
+        + " ...  (Ctrl-C to quit)\n"
+    )
+
+    def pretty(msg: dict) -> str:
+        notif = msg.get("notification", "")
+        p = msg.get("params", {})
+        if notif == "Integrations.StateChanged":
+            thing_id = p.get("thingId")
+            state_id = p.get("stateTypeId")
+            value = p.get("value")
+            thing = thing_by_id.get(thing_id, {})
+            cls = class_by_id.get(thing.get("thingClassId", ""), {})
+            state_name = next(
+                (s["name"] for s in cls.get("stateTypes", []) if s["id"] == state_id),
+                state_id,
+            )
+            return f"{thing.get('name', thing_id):<40}  {state_name:<20}  = {value}"
+        if notif == "Integrations.EventTriggered":
+            event = p.get("event", {})
+            thing_id = event.get("thingId")
+            event_id = event.get("eventTypeId")
+            thing = thing_by_id.get(thing_id, {})
+            cls = class_by_id.get(thing.get("thingClassId", ""), {})
+            event_name = next(
+                (e["name"] for e in cls.get("eventTypes", []) if e["id"] == event_id),
+                event_id,
+            )
+            return f"{thing.get('name', thing_id):<40}  {event_name:<20}  (event)"
+        return f"{notif}  {json.dumps(p)}"
+
+    def on_notif(msg: dict) -> None:
+        if filter_thing_id is not None:
+            p = msg.get("params", {})
+            tid = p.get("thingId") or p.get("event", {}).get("thingId")
+            if tid != filter_thing_id:
+                return
+        ts = time.strftime("%H:%M:%S")
+        line = pretty(msg)
+        if args.json:
+            print(json.dumps({"ts": ts, "msg": msg}), flush=True)
+        else:
+            print(f"{ts}  {line}", flush=True)
+
+    try:
+        client.recv_loop(on_notif)
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+
+
+def cmd_log_set(args: argparse.Namespace) -> None:
+    client = build_client(args)
+    # Nymea's runtime log-level toggle method name has varied by version.
+    # Try the plausible candidates in order; surface the actual error from
+    # the last one if none work so the user knows to fall back.
+    attempts = [
+        ("Logging.SetLogLevel", {"category": args.category, "level": args.level}),
+        ("JSONRPC.SetLogLevel", {"category": args.category, "level": args.level}),
+    ]
+    last_err: Optional[Exception] = None
+    for method, params in attempts:
+        try:
+            client.call(method, params)
+            print(f"ok: {method}  {args.category}={args.level}")
+            return
+        except NymeaError as e:
+            last_err = e
+    sys.stderr.write(
+        "nymea-cli: runtime log-level change is not supported by this nymead.\n"
+        f"last error: {last_err}\n"
+        "Fallback: edit /etc/nymea/nymead.conf [LoggingRules] and `systemctl restart nymead`.\n"
+    )
+    sys.exit(1)
+
+
+def cmd_raw(args: argparse.Namespace) -> None:
+    """Escape hatch: issue an arbitrary method call with JSON params."""
+    client = build_client(args)
+    params: Optional[dict] = None
+    if args.params:
+        try:
+            params = json.loads(args.params)
+        except json.JSONDecodeError as e:
+            raise NymeaError(f"bad --params JSON: {e}") from e
+    print(json.dumps(client.call(args.method, params), indent=2))
+
+
+# --------------------------------------------------------------------------
+# argparse plumbing
+# --------------------------------------------------------------------------
+
+
+def _attach_common(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--host", help="nymead host (default: config / 127.0.0.1)")
+    p.add_argument("--port", type=int, help="WebSocket port (default: 4444)")
+    p.add_argument(
+        "--plain",
+        action="store_true",
+        help="use ws:// instead of wss:// (no TLS)",
+    )
+    p.add_argument(
+        "--secure",
+        dest="insecure",
+        action="store_false",
+        help="verify TLS cert (default: skip verification; nymead uses a self-signed cert)",
+    )
+    p.set_defaults(insecure=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="nymea-cli",
+        description="Command-line client for nymead's JSON-RPC API.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("login", help="authenticate and cache a token")
+    _attach_common(sp)
+    sp.add_argument("--user")
+    sp.add_argument("--password", help="password (will prompt if omitted)")
+    sp.set_defaults(func=cmd_login)
+
+    sp = sub.add_parser("things", help="query things")
+    sp_sub = sp.add_subparsers(dest="sub", required=True)
+    spl = sp_sub.add_parser("list", help="list things")
+    _attach_common(spl)
+    spl.add_argument("filter", nargs="?", help="case-insensitive substring filter on name")
+    spl.add_argument("--json", action="store_true")
+    spl.set_defaults(func=cmd_things_list)
+
+    sp = sub.add_parser("state", help="query thing state")
+    sp_sub = sp.add_subparsers(dest="sub", required=True)
+    spg = sp_sub.add_parser("get", help="get current state value(s)")
+    _attach_common(spg)
+    spg.add_argument("thing", help="thing name or id")
+    spg.add_argument("state", nargs="?", help="state name or id (omit for all)")
+    spg.add_argument("--json", action="store_true")
+    spg.set_defaults(func=cmd_state_get)
+
+    sp = sub.add_parser("action", help="execute an action on a thing")
+    sp_sub = sp.add_subparsers(dest="sub", required=True)
+    spe = sp_sub.add_parser("exec", help="execute action")
+    _attach_common(spe)
+    spe.add_argument("thing", help="thing name or id")
+    spe.add_argument("action", help="action name or id")
+    spe.add_argument(
+        "params",
+        nargs="*",
+        help="paramName=value pairs (values are parsed as JSON if possible, else string)",
+    )
+    spe.add_argument("--json", action="store_true")
+    spe.set_defaults(func=cmd_action_exec)
+
+    sp = sub.add_parser("events", help="stream nymead notifications")
+    sp_sub = sp.add_subparsers(dest="sub", required=True)
+    spw = sp_sub.add_parser("watch", help="watch state/event notifications")
+    _attach_common(spw)
+    spw.add_argument("--filter-thing", help="only emit for this thing")
+    spw.add_argument(
+        "--namespace",
+        action="append",
+        help="JSON-RPC namespace to subscribe (repeatable, default: Integrations)",
+    )
+    spw.add_argument("--json", action="store_true")
+    spw.set_defaults(func=cmd_events_watch)
+
+    sp = sub.add_parser("log", help="toggle log categories (if nymead supports it)")
+    sp_sub = sp.add_subparsers(dest="sub", required=True)
+    sps = sp_sub.add_parser("set", help="set a category's level at runtime")
+    _attach_common(sps)
+    sps.add_argument("category", help="e.g. GenericShading, UniPi, IOConnections")
+    sps.add_argument("level", choices=["debug", "info", "warning", "critical"])
+    sps.set_defaults(func=cmd_log_set)
+
+    sp = sub.add_parser("raw", help="issue an arbitrary JSON-RPC call (escape hatch)")
+    _attach_common(sp)
+    sp.add_argument("method", help="e.g. Integrations.GetThings")
+    sp.add_argument("--params", help="JSON object with params")
+    sp.set_defaults(func=cmd_raw)
+
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except NymeaError as e:
+        sys.stderr.write(f"nymea-cli: {e}\n")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
